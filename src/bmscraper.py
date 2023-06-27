@@ -1,6 +1,6 @@
 ###
 #    This is a web scraper application that can be used to scrape job
-#    advertisement pages from brightermonday.co.ke, save the results in a json file
+#    advertisement pages on brightermonday.co.ke, save the results in a json file
 #    and retrieve results based on search criteria - job title, location,
 #    company, date posted or all four criteria if "you're feeling lucky" ;)
 #    
@@ -8,18 +8,25 @@
 ###
 
 from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.common.by import By
 from selenium.common.exceptions import NoSuchElementException
 from bs4 import BeautifulSoup
 from time import sleep
 from datetime import datetime
 from collections import OrderedDict
 from argparse import ArgumentParser
+import urllib.request
+import urllib.error
 import json
 import os
 import re
+import uuid
 
-BASE_URL = 'https://www.brightermonday.co.ke/'
-JOBS_URL = BASE_URL + 'jobs/'
+BASE_URL = 'https://brightermonday.co.ke/'
+JOBS_URL = BASE_URL + 'jobs/it-telecoms'
+
 
 # json file name regex
 # '^(brightermondayjobs)\_[0-9]{8,8}\-[0-9]{6,6}\.(json)$'
@@ -37,6 +44,15 @@ class BrighterMondayJobsScraper:
     # Will be toggled accordingly in case of errors while scraping for data
     scraping_error = False
 
+    # Init selenium
+    options = webdriver.ChromeOptions()
+    options.add_argument('--disable-blink-features=AutomationControlled')
+    # options.add_argument('--headless')
+
+    driver = webdriver.Chrome(options=options, service=Service(ChromeDriverManager().install()))
+    driver.set_window_size(1366, 768)
+    driver.implicitly_wait(5)
+
     # The app's awesome main menu
     uiWindow = """
     ----------------------------------------------------------------------------------------
@@ -52,17 +68,14 @@ class BrighterMondayJobsScraper:
 
     # The main scraping function
     def scrape_jobs(self):
-        self.driver = webdriver.Chrome()
-        self.driver.set_window_size(1024, 768)
-        self.driver.implicitly_wait(5)
         self.driver.get(JOBS_URL)
 
         # wait for page to load, check for the cookie consent section
         # and programmatically click the agree button
 
-        if self.driver.find_element_by_css_selector('div.button.js-cookie-consent-agree'):
+        if self.driver.find_element(By.ID, 'onetrust-accept-btn-handler'):
             print('>>> Found cookie agree button')
-            cookie_agree_button = self.driver.find_element_by_css_selector('div.button.js-cookie-consent-agree')
+            cookie_agree_button = self.driver.find_element(By.ID, 'onetrust-accept-btn-handler')
             cookie_agree_button.click()
             print('>>> Cookie agree button clicked. Waiting for 5 seconds to begin scraping...')
             sleep(5);
@@ -82,80 +95,103 @@ class BrighterMondayJobsScraper:
                     break
 
                 soup = BeautifulSoup(self.driver.page_source, 'lxml')
-                job_sections = soup.find_all('article', class_='search-result')
+                job_sections = soup.find_all(attrs={"data-cy": "listing-cards-components"})
 
-                print("Scraping page {!s}".format(current_page))
                 for job_section in job_sections:
+
+                    # Skip featured jobs
+                    try:
+                        if job_section.find('div', class_='flex flex-shrink-0 justify-center items-center w-5 text-xs font-medium text-white uppercase rounded-l-md rounded-bl-none bg-brand-secondary').span.text.strip() == 'FEATURED':
+                            print('>>> Skipping featured job')
+                            continue
+                    except AttributeError:
+                        pass
 
                     # We use Python's OrderedDict data structure to store and retrieve data in the order
                     # they are stored, unlike the in traditional dictionary
                     job = OrderedDict()
 
-                    if job_section.find('a', class_='search-result__job-title'):
-                        job['Title'] = job_section.find('a', class_='search-result__job-title').h3.text.strip()
-                        job['Link'] = job_section.find('a', class_='search-result__job-title')['href']
+                    # Generate UUID for the job
+                    job['ID'] = str(uuid.uuid4())
+
+                    if job_section.find('a', class_="relative mb-3 text-lg font-medium break-words focus:outline-none metrics-apply-now text-link-500 text-loading-animate"):
+                        job['Title'] = job_section.find('a', class_="relative mb-3 text-lg font-medium break-words focus:outline-none metrics-apply-now text-link-500 text-loading-animate").p.text.strip()
+                        job['Link'] = job_section.find('a', class_="relative mb-3 text-lg font-medium break-words focus:outline-none metrics-apply-now text-link-500 text-loading-animate")['href']
+                        # use selenium to launch another window to fetch content from the job link
+                        # and extract job summary and job description
+                        # then close the window
+                        try:
+                            self.driver.execute_script("window.open('');")
+                            self.driver.switch_to.window(self.driver.window_handles[1])
+                            self.driver.get(job['Link'])
+                            job_soup = BeautifulSoup(self.driver.page_source, 'lxml')
+                            job_summary_desc = job_soup.find('article', class_='job__details')
+                            # find job summary and job description in the job details section
+                            # and store them in the job dict
+                            # if not found, store 'No summary available' and 'No description available'
+                            # respectively
+                            job_summary_desc_list = job_summary_desc.find_all('div', class_='py-5 px-4 border-b border-gray-300 md:p-5')
+                            if job_summary_desc_list[0].h3.text.strip() == 'Job Summary':
+                                job['Summary'] = str(job_summary_desc_list[0])
+                            else:
+                                job['Summary'] = 'No summary available'
+                            if "Job Description" in job_summary_desc_list[1].h3.text.strip():
+                                job['Description'] = str(job_summary_desc_list[1])
+                            else:
+                                job['Description'] = 'No description available'
+                            # job['Description'] = job_summary_desc.text.strip()
+                            self.driver.close()
+                            self.driver.switch_to.window(self.driver.window_handles[0])
+                        except Exception as e:
+                            print('>>> Error fetching job summary and description')
+                            print(e)
+                            job['Summary'] = 'No summary available'
+                            job['Description'] = 'No description available'
                     else:
                         job['Title'] = 'No title provided'
                         job['Link'] = 'No link available'
 
-                    if job_section.find('div', class_='search-result__location'):
-                        job_location = job_section.find('div', class_='search-result__location').text.strip()
-                        job['Location'] = job_location
+                    if job_section.find('p', class_='text-sm text-link-500'):
+                        job_poster = job_section.find('p', class_='text-sm text-link-500').text.strip()
+                        job['Poster'] = job_poster
                     else:
-                        job['Location'] = 'No location provided'
+                        job['Poster'] = 'No job poster found'
 
-                    if job_section.find('div', class_='job-header__salary'):
-                        if job_section.find('div', class_='job-header__salary'):
-                            currency_symbol = job_section.find('span', class_='text--bold')
-                            currency_symbol = currency_symbol.text.strip()
-                        else:
-                            currency_symbol = ''
-                        salary_text = job_section.find('span', class_='margin-right--5')
-                        salary_text = salary_text.find(text=True, recursive=False).strip()
-                        job['Salary'] = currency_symbol + salary_text
-                    else:
-                        job['Salary'] = 'Confidential / Not provided'
+                    if job_section.find('div', class_='flex flex-wrap mt-3 text-sm text-gray-500 md:py-0'):
+                        job_location_type_salary = job_section.find('div', class_='flex flex-wrap mt-3 text-sm text-gray-500 md:py-0')
+                        job_location_type_salary = job_location_type_salary.find_all('span')
+                        job['Location'] = job_location_type_salary[0].text.strip()
+                        job['Type'] = job_location_type_salary[1].text.strip()
+                        job['Salary'] = job_location_type_salary[2].text.strip()
 
-                    if job_section.find('span', class_='search-result__job-type'):
-                        job['Type'] = job_section.find('span', class_='search-result__job-type').text.strip()
-                    else:
-                        job['Type'] = 'No type provided'
-
-                    if job_section.find('div', class_='search-result__job-meta'):
-                        poster_text = job_section.find('div',
-                                class_='search-result__job-meta').text.strip()
-                        job['Poster'] = poster_text
-                    else:
-                        job['Poster'] = 'Job poster not provided'
-
-                    if job_section.find('div', class_='search-result__job-function'):
-                        job_category = job_section.find('div', class_='search-result__job-function')
-                        job_category = job_category.find('span', class_='padding-lr-10')
-                        job_category = job_category.text.strip()
-                        job['Category'] = job_category
+                    if job_section.find('p', class_='text-sm text-gray-500 text-loading-animate inline-block'):
+                        job_category = job_section.find('p', class_='text-sm text-gray-500 text-loading-animate inline-block').text.strip()
+                        job['Category'] = job_category.split(":")[1].strip()
                     else:
                         job['Category'] = 'Category not provided'
 
-                    if job_section.find('div', class_='top-jobs__content__time'):
+                    if job_section.find('div', class_='flex flex-row items-start items-center px-5 py-3 w-full border-t border-gray-300'):
                         date_posted = job_section.find('div',
-                                class_='top-jobs__content__time').text.strip()
+                                class_='flex flex-row items-start items-center px-5 py-3 w-full border-t border-gray-300').p.text.strip()
                         job['Date_Posted'] = date_posted
                     else:
                         job['Date_Posted'] = 'Date posted not provided'
 
                     # Add scraped data to `jobs` array
                     jobs.append(job)
+                print("Scraped page {!s}".format(current_page))
 
                 # Check if we have a next page
                 try:
-                    next_page_elem = self.driver.find_element_by_xpath("//a[@rel='next']")
-
+                    next_page_elem = self.driver.find_element(By.XPATH, value="//nav[@role='navigation']/div/a[@rel='next']")
                     # Navigate to next page if we still have more pages to
                     # scrape
                     if next_page_elem and (current_page < self.pages):
-                        next_page_elem.click()
+                        # next_page_elem.click()
+                        print('>>> Navigating to next page and waiting for page to load...')
+                        self.driver.get(JOBS_URL + '?page=' + str(next_page))
                         next_page += 1
-                        sleep(1) # wait for 1 second before scraping next page
+                        sleep(5) # wait for 1 second before scraping next page
                     else:
                         break
                 except NoSuchElementException:
